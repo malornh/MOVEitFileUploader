@@ -23,7 +23,7 @@ It also polls the cloud folder for changes and updates the local folder to refle
 
 1. **Clone the repository:**
    ```sh
-   git clone https://github.com/malornh/MoveitFileUploaderApp.git
+   git clone https://github.com/malornh/MOVEitFileUploader.git
    cd MoveitFileUploaderApp
 
 dotnet restore
