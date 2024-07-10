@@ -44,9 +44,6 @@ namespace MoveitFileUploaderLib
                 Console.Write("Enter local folder path: ");
                 _folderPath = Console.ReadLine();
 
-                // Adjust format of local folder path if needed
-                _folderPath = _folderPath.Replace("\\", "\\\\");
-
                 if (!Directory.Exists(_folderPath))
                 {
                     _logger.LogError($"Directory '{_folderPath}' does not exist.");
@@ -70,8 +67,11 @@ namespace MoveitFileUploaderLib
                     EnableRaisingEvents = true
                 };
 
-                watcher.Created += async (sender, e) => await OnFileCreated(e.FullPath);
-                watcher.Deleted += async (sender, e) => await OnFileDeleted(e.FullPath);
+                watcher.Created += async (sender, e) => await OnFileCreated(e.FullPath, accessToken);
+                watcher.Deleted += async (sender, e) => await OnFileDeleted(e.FullPath, accessToken);
+
+                // Start polling for changes in cloud folder
+                _ = PollCloudFolderForChanges(accessToken);
 
                 _logger.LogInformation($"Monitoring {_folderPath}. Press [enter] to exit.");
                 Console.ReadLine();
@@ -109,8 +109,8 @@ namespace MoveitFileUploaderLib
                 response.EnsureSuccessStatusCode();
 
                 var responseString = await response.Content.ReadAsStringAsync();
-                var jsonResponse = Newtonsoft.Json.JsonConvert.DeserializeObject<dynamic>(responseString);
-                return jsonResponse.access_token;
+                var jsonResponse = JObject.Parse(responseString);
+                return jsonResponse["access_token"].ToString();
             }
             catch (Exception ex)
             {
@@ -132,23 +132,23 @@ namespace MoveitFileUploaderLib
                 response.EnsureSuccessStatusCode();
 
                 var responseString = await response.Content.ReadAsStringAsync();
-                var jsonResponse = Newtonsoft.Json.JsonConvert.DeserializeObject<dynamic>(responseString);
-                var items = jsonResponse.items;
+                var jsonResponse = JObject.Parse(responseString);
+                var items = jsonResponse["items"];
 
                 foreach (var item in items)
                 {
-                    string filePath = Path.Combine(_folderPath, item.name.ToString());
-                    string fileId = item.id.ToString();
+                    string filePath = Path.Combine(_folderPath, item["name"].ToString());
+                    string fileId = item["id"].ToString();
 
                     if (!File.Exists(filePath))
                     {
-                        _logger.LogInformation($"Downloading {item.name}...");
+                        _logger.LogInformation($"Downloading {item["name"]}...");
                         var fileResponse = await client.GetAsync($"https://testserver.moveitcloud.com/api/v1/files/{fileId}/download");
                         fileResponse.EnsureSuccessStatusCode();
 
                         var fileBytes = await fileResponse.Content.ReadAsByteArrayAsync();
                         await File.WriteAllBytesAsync(filePath, fileBytes);
-                        _logger.LogInformation($"{item.name} downloaded.");
+                        _logger.LogInformation($"{item["name"]} downloaded.");
                     }
                 }
 
@@ -174,13 +174,13 @@ namespace MoveitFileUploaderLib
                 response.EnsureSuccessStatusCode();
 
                 var responseString = await response.Content.ReadAsStringAsync();
-                var jsonResponse = Newtonsoft.Json.JsonConvert.DeserializeObject<dynamic>(responseString);
-                var items = jsonResponse.items;
+                var jsonResponse = JObject.Parse(responseString);
+                var items = jsonResponse["items"];
 
                 Console.WriteLine("Uploaded files:");
                 foreach (var item in items)
                 {
-                    Console.WriteLine(item.name.ToString());
+                    Console.WriteLine(item["name"].ToString());
                 }
 
                 _logger.LogInformation("Files displayed.");
@@ -192,32 +192,38 @@ namespace MoveitFileUploaderLib
             }
         }
 
-        private async Task OnFileCreated(string filePath)
+        private async Task OnFileCreated(string filePath, string accessToken)
         {
-            _logger.LogInformation($"File {filePath} has been added.");
             try
             {
+                _logger.LogInformation($"File created: {filePath}");
+
                 string token = await GetAccessToken();
                 string homeFolderID = await GetHomeFolder(token);
                 await UploadFileToMoveitTransfer(filePath, token, homeFolderID);
+
+                await UploadFileToMoveitTransfer(filePath, accessToken, homeFolderID);
+                ListAndPrintLocalFiles(); // Update and print the list of local files
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "An error occurred while uploading the file.");
+                _logger.LogError(ex, $"Error occurred handling created file: {filePath}");
+                throw;
             }
         }
 
-        private async Task OnFileDeleted(string filePath)
+        private async Task OnFileDeleted(string filePath, string accessToken)
         {
             try
             {
-                string fileName = Path.GetFileName(filePath);
-                string accessToken = await GetAccessToken();
-                await DeleteFileFromCloud(fileName, accessToken);
+                _logger.LogInformation($"File deleted: {filePath}");
+                await DeleteFileFromCloud(filePath, accessToken);
+                ListAndPrintLocalFiles(); // Update and print the list of local files
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Error occurred while deleting {Path.GetFileName(filePath)} from cloud.");
+                _logger.LogError(ex, $"Error occurred handling deleted file: {filePath}");
+                throw;
             }
         }
 
@@ -251,18 +257,45 @@ namespace MoveitFileUploaderLib
                 using var client = _httpClientFactory.CreateClient();
                 client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
+                // Check if the file already exists in the cloud
+                var response = await client.GetAsync($"https://testserver.moveitcloud.com/api/v1/folders/{homeFolderID}/files");
+                response.EnsureSuccessStatusCode();
+
+                var responseString = await response.Content.ReadAsStringAsync();
+                var jsonResponse = JObject.Parse(responseString);
+                var items = jsonResponse["items"];
+
+                string fileName = Path.GetFileName(filePath);
+                bool fileExistsInCloud = false;
+
+                foreach (var item in items)
+                {
+                    if (item["name"].ToString() == fileName)
+                    {
+                        fileExistsInCloud = true;
+                        break;
+                    }
+                }
+
+                if (fileExistsInCloud)
+                {
+                    _logger.LogInformation($"File {filePath} already exists in the cloud. Skipping upload.");
+                    return;
+                }
+
+                // Proceed with file upload
                 using var form = new MultipartFormDataContent();
                 byte[] fileBytes = File.ReadAllBytes(filePath);
-                form.Add(new ByteArrayContent(fileBytes, 0, fileBytes.Length), "file", Path.GetFileName(filePath));
+                form.Add(new ByteArrayContent(fileBytes, 0, fileBytes.Length), "file", fileName);
 
-                var response = await client.PostAsync($"https://testserver.moveitcloud.com/api/v1/folders/{homeFolderID}/files", form);
-                response.EnsureSuccessStatusCode();
+                var uploadResponse = await client.PostAsync($"https://testserver.moveitcloud.com/api/v1/folders/{homeFolderID}/files", form);
+                uploadResponse.EnsureSuccessStatusCode();
 
                 _logger.LogInformation($"File {filePath} uploaded successfully.");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Failed to upload file {filePath}.");
+                _logger.LogError(ex, $"Error occurred while uploading file {filePath}.");
                 throw;
             }
         }
@@ -279,23 +312,24 @@ namespace MoveitFileUploaderLib
                 response.EnsureSuccessStatusCode();
 
                 var responseString = await response.Content.ReadAsStringAsync();
-                var jsonResponse = Newtonsoft.Json.JsonConvert.DeserializeObject<dynamic>(responseString);
-                var items = jsonResponse.items;
+                var jsonResponse = JObject.Parse(responseString);
+                var items = jsonResponse["items"];
 
                 string fileId = null;
                 foreach (var item in items)
                 {
-                    if (item.name.ToString() == fileName)
+                    if (item["name"].ToString() == fileName)
                     {
-                        fileId = item.id.ToString();
+                        fileId = item["id"].ToString();
                         break;
                     }
                 }
 
-                if (fileId != null)
+                if (!string.IsNullOrEmpty(fileId))
                 {
                     var deleteResponse = await client.DeleteAsync($"https://testserver.moveitcloud.com/api/v1/files/{fileId}");
                     deleteResponse.EnsureSuccessStatusCode();
+
                     _logger.LogInformation($"File {fileName} deleted from cloud.");
                 }
                 else
@@ -305,7 +339,75 @@ namespace MoveitFileUploaderLib
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, $"Failed to delete file {Path.GetFileName(filePath)} from cloud.");
+                _logger.LogError(ex, "Failed to delete file from cloud.");
+                throw;
+            }
+        }
+
+        private async Task PollCloudFolderForChanges(string accessToken)
+        {
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(10000); // Poll every 10 seconds
+
+                    using var client = _httpClientFactory.CreateClient();
+                    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+                    var response = await client.GetAsync("https://testserver.moveitcloud.com/api/v1/files");
+                    response.EnsureSuccessStatusCode();
+
+                    var responseString = await response.Content.ReadAsStringAsync();
+                    var jsonResponse = JObject.Parse(responseString);
+                    var items = jsonResponse["items"];
+
+                    foreach (var item in items)
+                    {
+                        string filePath = Path.Combine(_folderPath, item["name"].ToString());
+                        if (!File.Exists(filePath))
+                        {
+                            _logger.LogInformation($"New file detected in cloud: {item["name"]}. Downloading...");
+                            var fileResponse = await client.GetAsync($"https://testserver.moveitcloud.com/api/v1/files/{item["id"]}/download");
+                            fileResponse.EnsureSuccessStatusCode();
+
+                            var fileBytes = await fileResponse.Content.ReadAsByteArrayAsync();
+                            await File.WriteAllBytesAsync(filePath, fileBytes);
+                            _logger.LogInformation($"{item["name"]} downloaded from cloud.");
+                        }
+                    }
+
+                    // Check for deletions
+                    var localFiles = Directory.GetFiles(_folderPath);
+                    foreach (var localFile in localFiles)
+                    {
+                        string localFileName = Path.GetFileName(localFile);
+                        bool fileExistsInCloud = false;
+
+                        foreach (var item in items)
+                        {
+                            if (item["name"].ToString() == localFileName)
+                            {
+                                fileExistsInCloud = true;
+                                break;
+                            }
+                        }
+
+                        if (!fileExistsInCloud)
+                        {
+                            _logger.LogInformation($"File {localFileName} deleted in cloud. Deleting locally...");
+                            File.Delete(localFile);
+                            _logger.LogInformation($"{localFileName} deleted locally.");
+                        }
+                    }
+
+                    ListAndPrintLocalFiles();
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "An error occurred while polling the cloud folder for changes.");
+                throw;
             }
         }
 
